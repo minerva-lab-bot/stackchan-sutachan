@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/banner.jpg" alt="すたちゃん" width="100%"></p>
+
 # スタックチャン × Groki Bot カスタム（すたちゃん）
 
 市販のスタックチャン（M5Stack CoreS3）＋オープンソースの [Groki Bot](https://github.com/JosssphZhou/groki-bot) を、AI と一緒に自分好みにカスタムしたものです。一から作ったわけではなく、上流プロジェクトに小さなパッチと設定を足しただけです。誰でも好きに真似して、自由にカスタムしてください。
