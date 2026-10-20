@@ -1,0 +1,245 @@
+diff --git a/gateway/scripts/gbot_voice_session_bridge.mjs b/gateway/scripts/gbot_voice_session_bridge.mjs
+index 0ce43dd..479313e 100644
+--- a/gateway/scripts/gbot_voice_session_bridge.mjs
++++ b/gateway/scripts/gbot_voice_session_bridge.mjs
+@@ -117,7 +117,12 @@ export class NativeSandboxClient {
+   }
+   async #fetch(path, options = {}) {
+     const connection = await this.#connect();
+-    return this.fetcher(connection.baseUrl + path, {...options, redirect: 'error', headers: {...connection.headers, ...options.headers}});
++    // Local patch: drop the cached sandbox connection on failure so the next call re-runs EnsureSandBox (stale gateway token).
++    let response;
++    try { response = await this.fetcher(connection.baseUrl + path, {...options, redirect: 'error', headers: {...connection.headers, ...options.headers}}); }
++    catch (error) { if (this.#connection === connection) this.#connection = undefined; throw error; }
++    if (!response.ok && this.#connection === connection) this.#connection = undefined;
++    return response;
+   }
+   async openEvents(signal) {
+     const deadline = new AbortController();
+@@ -396,6 +401,8 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
+       if (nativePresence) {
+         if (presenceBusy) return send(409, {ok: false, error: 'presence_busy'});
+         if (!activeCall && !body.isOnTheLine) return send(403, {ok: false, error: 'call_not_allowed'});
++        // Local patch: a new on-the-line call from a restarted gateway replaces a stale one.
++        if (activeCall && body.callId !== activeCall.callId && body.isOnTheLine) { activeCall = null; for (const controller of streams) controller.abort(); }
+         if (activeCall && body.callId !== activeCall.callId) return send(409, {ok: false, error: 'call_conflict'});
+         presenceBusy = true;
+         try {
+diff --git a/gateway/stackchan_mcp/gbot_voice_bridge.py b/gateway/stackchan_mcp/gbot_voice_bridge.py
+index df8e927..95a07ce 100644
+--- a/gateway/stackchan_mcp/gbot_voice_bridge.py
++++ b/gateway/stackchan_mcp/gbot_voice_bridge.py
+@@ -272,6 +272,16 @@ class GbotVoiceBridge:
+         logger.info("Grok voice declared tools=%s", ",".join(names))
+         return declarations
+ 
++    def _language_preamble(self):
++        # Local patch: make the reply language explicit for real mic turns.
++        if self.language == "ja":
++            return "常に日本語で話す。ユーザーは日本語で話す。英語で返答しないこと。\n\n"
++        return ""
++
++    def _extra_instructions(self):
++        extra = os.getenv("STACKCHAN_GBOT_VOICE_EXTRA_INSTRUCTIONS", "").strip()
++        return ("\n\n" + extra) if extra else ""
++
+     def _provider_tool_instructions(self):
+         if not self._executor or not self._local_tools_enabled:
+             return ""
+@@ -321,14 +331,15 @@ class GbotVoiceBridge:
+ 
+     @staticmethod
+     def _desktop_failure(code, *, refused=False):
++        ja = os.getenv("STACKCHAN_GBOT_VOICE_LANGUAGE", "") == "ja"  # local patch
+         if refused:
+-            return {"relay": "refused", "spoken": "桌面助手没有受理这项任务。"}
++            return {"relay": "refused", "spoken": "依頼を受け付けられませんでした。" if ja else "桌面助手没有受理这项任务。"}
+         return {
+             "relay": "unreachable",
+             "spoken": (
+-                "桌面助手暂时未连上，请稍后再试。"
++                ("いまGrok Botにつながっていません。少し後でもう一度お願いします。" if ja else "桌面助手暂时未连上，请稍后再试。")
+                 if code == "native_not_ready"
+-                else "桌面助手暂时无法受理任务，请稍后再试。"
++                else ("いま依頼を受け付けられません。少し後でもう一度お願いします。" if ja else "桌面助手暂时无法受理任务，请稍后再试。")
+             ),
+             "errorClass": "voice_bridge",
+         }
+@@ -607,7 +618,9 @@ class GbotVoiceBridge:
+             stage = "provider_instructions"
+             self.metrics["startup_stage"] = stage
+             config = {
+-                "instructions": session.get("instructions", "请用中文简短自然地对话。")
++                "instructions": self._language_preamble()
++                + session.get("instructions", "请用中文简短自然地对话。")
++                + self._extra_instructions()
+                 + (
+                     "\n\n" + self._provider_tool_instructions()
+                     if self._executor and self._local_tools_enabled
+@@ -804,6 +817,12 @@ class GbotVoiceBridge:
+             if self._on_transcript:
+                 await self._on_transcript(event)
+             text = event.get("transcript", "")
++            # Local patch: opt-in log of what the server heard from the mic.
++            if (
++                kind == "conversation.item.input_audio_transcription.completed"
++                and os.getenv("STACKCHAN_GBOT_LOG_USER_TRANSCRIPT") == "1"
++            ):
++                logger.info("Grok voice user transcript: %s", text)
+             if kind == "conversation.item.input_audio_transcription.completed":
+                 if self._executor:
+                     await self._executor.observe_user_input(text, finished=True)
+@@ -907,8 +926,8 @@ class GbotVoiceBridge:
+                     if name == "send_task"
+                     else {
+                         "ok": False,
+-                        "error": "桌面助手暂时未连上，请稍后再试。",
+-                        "spoken": "桌面助手暂时未连上，请稍后再试。",
++                        "error": "desktop not ready",
++                        "spoken": "いまGrok Botにつながっていません。" if self.language == "ja" else "桌面助手暂时未连上，请稍后再试。",
+                     }
+                 )
+             elif name == "send_task":
+diff --git a/gateway/stackchan_mcp/gemini_voice_proxy.py b/gateway/stackchan_mcp/gemini_voice_proxy.py
+index d8cd6df..5e10359 100644
+--- a/gateway/stackchan_mcp/gemini_voice_proxy.py
++++ b/gateway/stackchan_mcp/gemini_voice_proxy.py
+@@ -354,7 +354,7 @@ class GeminiVoiceProxy:
+             available=bool(gate is not None and gate.available),
+             state=gate.state.value if gate is not None else "DORMANT",
+         )
+-        self._bridge = self._make_bridge(
++        self._bridge_factory = lambda: self._make_bridge(
+             esp32,
+             api_key=api_key,
+             response_modality="TEXT",
+@@ -370,6 +370,7 @@ class GeminiVoiceProxy:
+             set_face_tracking=self.set_face_tracking,
+             debug_status=self._status,
+         )
++        self._bridge = self._bridge_factory()
+         try:
+             await self._bridge.start()
+         except Exception as exc:
+@@ -519,6 +520,12 @@ class GeminiVoiceProxy:
+             return False
+         if not data:
+             return True
++        if os.getenv("STACKCHAN_EXTERNAL_MIC", "").strip():
++            # Local patch: use a Mac-attached mic instead of the device mic.
++            task = getattr(self, "_ext_mic_task", None)
++            if task is None or task.done():
++                self._ext_mic_task = asyncio.create_task(self._run_external_mic())
++            return True
+         pcm = self._codec.decode_device_frame(data)
+         if not pcm:
+             return False
+@@ -529,6 +536,44 @@ class GeminiVoiceProxy:
+             logger.warning("Gemini send_audio failed: %s", exc)
+             return False
+ 
++    async def _run_external_mic(self) -> None:
++        """Local patch: stream a Mac mic (ffmpeg avfoundation) as 16 kHz PCM."""
++        device = os.getenv("STACKCHAN_EXTERNAL_MIC", "").strip()
++        ffmpeg = os.getenv("STACKCHAN_FFMPEG", "/opt/homebrew/bin/ffmpeg")
++        gain = os.getenv("STACKCHAN_EXTERNAL_MIC_GAIN", "1.0")
++        chunk = 1920  # 60 ms at 16 kHz mono s16le
++        while not self._stopped:
++            proc = None
++            try:
++                proc = await asyncio.create_subprocess_exec(
++                    ffmpeg, "-hide_banner", "-loglevel", "error",
++                    "-f", "avfoundation", "-i", f":{device}",
++                    "-af", f"volume={gain}", "-ac", "1", "-ar", "16000",
++                    "-f", "s16le", "-",
++                    stdout=asyncio.subprocess.PIPE,
++                    stderr=asyncio.subprocess.PIPE,
++                )
++                logger.info("external mic started device=%r", device)
++                assert proc.stdout is not None
++                while not self._stopped:
++                    pcm = await proc.stdout.readexactly(chunk)
++                    if self._accepts_device_audio():
++                        await self._forward_gated_device_pcm(pcm)
++            except asyncio.CancelledError:
++                raise
++            except Exception as exc:
++                err = b""
++                if proc is not None and proc.stderr is not None:
++                    try:
++                        err = await asyncio.wait_for(proc.stderr.read(400), 1)
++                    except Exception:
++                        pass
++                logger.warning("external mic failed: %s %s", exc, err.decode(errors="ignore"))
++                await asyncio.sleep(3)
++            finally:
++                if proc is not None and proc.returncode is None:
++                    proc.kill()
++
+     def _configure_wake_gate(self, gate: WakeGate | None) -> None:
+         if gate is not None:
+             gate.is_tts_active = lambda: self._tts_active
+@@ -655,6 +700,41 @@ class GeminiVoiceProxy:
+             await self._set_leds_safe(*DEAD_LED_RGB)
+         except Exception:
+             logger.exception("session-dead red LED failed")
++        # Local patch: auto-reconnect the voice session (server closes it after ~15 min).
++        if not getattr(self, "_stopped", False) and getattr(self, "_bridge_factory", None) and not getattr(self, "_reconnect_task", None):
++            self._reconnect_task = asyncio.create_task(self._auto_reconnect())
++
++    async def _auto_reconnect(self) -> None:
++        delay = 2.0
++        try:
++            while not self._stopped:
++                await asyncio.sleep(delay)
++                if self._stopped:
++                    return
++                old = self._bridge
++                try:
++                    if old is not None:
++                        await old.stop()
++                except Exception:
++                    logger.warning("voice reconnect: old bridge stop failed")
++                try:
++                    bridge = self._bridge_factory()
++                    self._bridge = bridge
++                    await bridge.start()
++                    if await bridge.wait_connected(timeout=10.0):
++                        self._reported_dead = False
++                        logger.info("voice session reconnected")
++                        try:
++                            await self._set_leds_safe(0, 0, 0)
++                        except Exception:
++                            pass
++                        return
++                    logger.warning("voice reconnect: did not connect within 10 s")
++                except Exception as exc:
++                    logger.warning("voice reconnect failed: %s", type(exc).__name__)
++                delay = min(delay * 2, 60.0)
++        finally:
++            self._reconnect_task = None
+ 
+     async def _handle_bridge_end_conversation(self) -> None:
+         """Close the wake window when Gemini explicitly ends the conversation."""
+diff --git a/gateway/stackchan_mcp/wake_gate.py b/gateway/stackchan_mcp/wake_gate.py
+index 07d463a..ea8f851 100644
+--- a/gateway/stackchan_mcp/wake_gate.py
++++ b/gateway/stackchan_mcp/wake_gate.py
+@@ -174,6 +174,8 @@ class SherpaOnnxKeywordSpotter:
+         return self._result_matches(result)
+ 
+     def _result_matches(self, result: str) -> bool:
++        if "|" in self._keyword:  # local patch: any configured keyword wakes
++            return True
+         if self._phrase in result:
+             return True
+         compact_result = "".join(ch.lower() for ch in result if ch.isalnum())
+@@ -470,6 +472,8 @@ def model_download_commands(target_dir: str | Path | None = None) -> str:
+ def keywords_file_body(keyword: str) -> str:
+     """Keywords file content: the configured keyword, plus its vowel variants for a built-in wake word."""
+     wanted = keyword.strip()
++    if "|" in wanted:  # local patch: several keywords separated by "|"
++        return "".join(f"{part.strip()}\n" for part in wanted.split("|") if part.strip())
+     variants: tuple[str, ...] = ()
+     if wanted == WAKE_KEYWORD:
+         variants = WAKE_KEYWORD_VARIANTS
